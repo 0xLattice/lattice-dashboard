@@ -1239,7 +1239,12 @@ async function loadSettings({ keepEdits = false } = {}) {
     const pending = keepEdits && settings.original ? mergePatch(settings.original, settings.draft || {}) : {};
     settings.original = frag.body; settings.etag = frag.etag;
     settings.draft = applyPatch(frag.body, pending); settings.review = null;
-  } catch (e) { toast(`Couldn't read settings: ${e.message}`); }
+    settings.failed = null;
+  } catch (e) {
+    // Said once per distinct failure: the page retries on every refresh.
+    if (settings.failed !== e.message) toast(`Couldn't read settings: ${e.message}`);
+    settings.failed = e.message;
+  }
   settings.loading = false;
   if (state.route.name === 'settings') rerender();
 }
@@ -1671,6 +1676,11 @@ async function stopFlow() {
     } catch (e) {
       if (e.status === 0 && !e.timedOut) { toast(`${n.name} stopped.`); refresh(n.id); return; }
       if (e.status === 401) { toast(`${n.name} was started again, by its process manager.`); refresh(n.id); return; }
+      // Not allowed to read /status: watch /health, which needs no token.
+      if (e.status === 403) {
+        try { await get(n, 'health', { timeout: 2000 }); }
+        catch (h) { if (h.status === 0 && !h.timedOut) { toast(`${n.name} stopped.`); refresh(n.id); return; } }
+      }
     }
     await new Promise((r) => setTimeout(r, 1000));
   }
