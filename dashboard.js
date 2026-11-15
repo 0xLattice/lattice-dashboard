@@ -124,8 +124,8 @@ class ApiError extends Error {
 function apiBase(node) {
   return `${node.url.replace(/\/+$/, '')}/`;
 }
-async function api(node, path, { method = 'GET', body, text = false, contentType = 'application/json', timeout = 12000, accept = [] } = {}) {
-  const headers = {};
+async function api(node, path, { method = 'GET', body, text = false, contentType = 'application/json', timeout = 12000, accept = [], headers: extra = {} } = {}) {
+  const headers = { ...extra };
   if (node.token) headers.Authorization = `Bearer ${node.token}`;
   if (body !== undefined) headers['Content-Type'] = contentType;
   let res;
@@ -146,7 +146,7 @@ async function api(node, path, { method = 'GET', body, text = false, contentType
     const message = (data && data.error && (data.error.message || data.error.reason)) || (typeof data === 'string' && data) || res.statusText || `HTTP ${res.status}`;
     throw new ApiError(res.status, message, data);
   }
-  return { status: res.status, data };
+  return { status: res.status, data, etag: res.headers.get('ETag') };
 }
 const get = async (node, path, opts) => (await api(node, path, opts)).data;
 const q = (path, chain) => (chain && chain !== 'Nexus' ? `${path}${path.includes('?') ? '&' : '?'}chainPath=${encodeURIComponent(chain)}` : path);
@@ -170,7 +170,7 @@ function persistSnap(id) {
   const n = node(id); const s = state.snaps[id];
   if (!n || !s) return;
   // Who the token is belongs to the token, not the node: asked afresh.
-  const keep = { ...s, who: undefined, whoToken: undefined, blockCache: undefined, logCache: undefined, pinsCache: undefined, mineLog: undefined };
+  const keep = { ...s, who: undefined, whoToken: undefined, blockCache: undefined, logCache: undefined, pinsCache: undefined };
   if (n.remember) lset(SNAP_KEY(id), keep); else sset(SNAP_KEY(id), keep);
 }
 function restoreSnap(id) {
@@ -201,15 +201,13 @@ async function refresh(id) {
       }
       const chains = ['Nexus', ...(hosted.chains || [])];
       const extra = await Promise.allSettled([
-        get(n, 'mining'),
         get(n, 'disk'),
         api(n, 'config', { accept: [409] }),
         get(n, 'metrics', { text: true }),
       ]);
-      if (extra[0].status === 'fulfilled') s.mining = extra[0].value;
-      if (extra[1].status === 'fulfilled') s.disk = extra[1].value;
-      if (extra[2].status === 'fulfilled') s.config = extra[2].value.status === 409 ? { flags: true } : extra[2].value.data;
-      if (extra[3].status === 'fulfilled') s.metrics = parseMetrics(extra[3].value);
+      if (extra[0].status === 'fulfilled') s.disk = extra[0].value;
+      if (extra[1].status === 'fulfilled') s.config = extra[1].value.status === 409 ? { flags: true } : extra[1].value.data;
+      if (extra[2].status === 'fulfilled') s.metrics = parseMetrics(extra[2].value);
       const per = await Promise.all(chains.map(async (path) => {
         const [health, peers, latest] = await Promise.allSettled([
           path === 'Nexus' ? Promise.resolve(status) : get(n, q('health', path)),
@@ -336,7 +334,10 @@ function chainVerdict(s, path) {
   const c = s.chains[path];
   const configured = (s.hosted && s.hosted.configured) || [];
   if (!c) {
-    if (configured.includes(path)) return { level: 'bad', text: "Didn't start", detail: "It's in the configuration but isn't running. The node log says why." };
+    if (configured.includes(path)) {
+      const st = chainStatus(s, path);
+      return { level: 'bad', text: "Didn't start", detail: st && st.error ? `It's in the configuration but isn't running: ${st.error}` : "It's in the configuration but isn't running. The node log says why." };
+    }
     return null;
   }
   const h = c.health;
@@ -359,8 +360,6 @@ function chainVerdict(s, path) {
   const rate = rateOf(s, path);
   const blockTime = s.blockTime[path];
   const cause = waitingCause(h.waiting);
-  // The mining loop merged-mines every hosted chain, paid or not.
-  const minedHere = !!(s.mining && s.mining.running);
   if (gap > 2) {
     if (still > 90e3 && watched > 60e3 && !(rate > 0)) {
       return {
@@ -382,15 +381,14 @@ function chainVerdict(s, path) {
   if (h.waiting) return { level: 'warn', text: 'Waiting on its next block', detail: cause };
   // When the node has no peers at all, Nexus says so once for every chain.
   const isolated = s.chains.Nexus && s.chains.Nexus.peers === 0;
-  if (c.peers === 0 && path !== 'Nexus' && !minedHere && isolated) return { level: 'quiet', text: 'no peers', detail: 'This node has no peers at all; see Nexus.' };
-  if (c.peers === 0 && path !== 'Nexus' && !minedHere) {
+  if (c.peers === 0 && path !== 'Nexus' && isolated) return { level: 'quiet', text: 'no peers', detail: 'This node has no peers at all; see Nexus.' };
+  if (c.peers === 0 && path !== 'Nexus') {
     return { level: 'warn', text: 'No peers', detail: "No other node is serving this chain to this one, so it won't hear about new blocks." };
   }
-  if (c.peers === 0 && path === 'Nexus' && !minedHere) {
+  if (c.peers === 0 && path === 'Nexus') {
     const hosted = ((s.hosted && s.hosted.chains) || []).length;
     return { level: 'warn', text: 'No peers', detail: `This node isn't connected to anyone, so it won't hear about new blocks${hosted ? ` on Nexus or the ${plural(hosted, 'chain')} it hosts` : ''}. Check its peers and network.` };
   }
-  if (c.peers === 0) return { level: 'quiet', text: 'only this node', detail: 'No peers serve this chain; this node mines it alone.' };
   return null;
 }
 
@@ -406,12 +404,6 @@ function attention(id = state.current) {
     if (v && (v.level === 'bad' || v.level === 'warn')) {
       items.push({ level: v.level, what: `${path}: ${v.text.toLowerCase()}`, why: v.detail, action: { label: 'Open chain', href: `#/chain/${path}` } });
     }
-  }
-  const m = s.mining;
-  if (m && m.enabled && !m.running) {
-    items.push({ level: 'warn', what: "Mining is on, but the miner isn't running", why: `${m.lastExit ? `It last stopped with ${m.lastExit}. ` : ''}The node starts it again 5 s after it exits${m.restarts ? `; it has restarted ${plural(m.restarts, 'time')}` : ''}.`, action: { label: 'Miner log', href: '#/logs?file=mine' } });
-  } else if (m && m.running && m.restarts > 2) {
-    items.push({ level: 'warn', what: `The miner has restarted ${plural(m.restarts, 'time')}`, why: m.lastExit ? `Last exit: ${m.lastExit}.` : '', action: { label: 'Miner log', href: '#/logs?file=mine' } });
   }
   if (s.disk && s.disk.freeBytes != null) {
     const free = s.disk.freeBytes;
@@ -433,7 +425,13 @@ function chainPaths(s) {
   for (const c of (s.hosted && s.hosted.configured) || []) set.add(c);
   return [...set].sort((a, b) => a.localeCompare(b));
 }
-const restartKeys = (s) => (s.config && s.config.restartRequired) || [];
+const configStatus = (s) => (s.config && s.config.status) || {};
+const restartKeys = (s) => configStatus(s).pendingRestart || [];
+/** The merged configuration (GET /config spec): what every layer says together. */
+const mergedSpec = (s) => (s.config && s.config.spec) || {};
+/** A chain's entry in GET /config status: the layers that list it, or the
+ *  listed chains under it that keep it hosted (impliedBy). */
+const chainStatus = (s, path) => (configStatus(s).chains || []).find((c) => c.path === path);
 
 // ---------------------------------------------------------------- routing
 
@@ -450,7 +448,6 @@ window.addEventListener('hashchange', () => { state.route = parseRoute(); leaveL
 const NAV = [
   { name: 'overview', label: 'Overview' },
   { name: 'logs', label: 'Logs' },
-  { name: 'mining', label: 'Mining' },
   { name: 'storage', label: 'Storage' },
   { name: 'settings', label: 'Settings' },
   { name: 'access', label: 'Access' },
@@ -551,19 +548,31 @@ setInterval(paintFreshness, 1000);
 function restartBanner() {
   return html`<div id="restart-slot">${restartBannerInner()}</div>`;
 }
-/** Whether this credential may make `route` ("METHOD /path", as GET
- *  /whoami lists it). Unknown until /whoami answers: offered, and the node
- *  decides. */
-function may(route = 'PATCH /config') {
+/** The settings layer this page writes: config.d/operator.json, the one
+ *  people and `lattice config set` write. */
+const FRAGMENT = 'operator';
+const WRITE = `PUT /config/fragments/${FRAGMENT}`;
+/** Whether a listed route ("METHOD /path", a parameter in braces, as GET
+ *  /whoami lists it) allows `route`: `PUT /config/fragments/{name}` allows
+ *  `PUT /config/fragments/operator`. */
+function routeAllows(listed, route) {
+  const [m1, p1 = ''] = listed.split(' '); const [m2, p2 = ''] = route.split(' ');
+  if (m1.toUpperCase() !== m2) return false;
+  const a = p1.split('/'); const b = p2.split('/');
+  return a.length === b.length && a.every((seg, i) => seg === b[i] || /^\{.+\}$/.test(seg));
+}
+/** Whether this credential may make `route`. Unknown until /whoami answers:
+ *  offered, and the node decides. */
+function may(route = WRITE) {
   const who = snap().who;
   if (!who || who.role === 'admin') return true;
   if (who.role === 'read') return false;
-  return (who.routes || []).some((r) => r.replace(/^\S+/, (m) => m.toUpperCase()) === route);
+  return (who.routes || []).some((r) => routeAllows(r, route));
 }
-function writeGuard(action, route = 'PATCH /config') {
+function writeGuard(action, route = WRITE) {
   return may(route) ? '' : html`<p class="why-not">This ${snap().who.role === 'read' ? 'read-only token' : 'token'} can't ${action}.</p>`;
 }
-const disabledUnless = (route = 'PATCH /config', action = 'change settings') => raw(may(route) ? '' : `disabled title="This token can't ${action}"`);
+const disabledUnless = (route = WRITE, action = 'change settings') => raw(may(route) ? '' : `disabled title="This token can't ${action}"`);
 function restartBannerInner() {
   const keys = restartKeys(snap());
   if (!keys.length) return '';
@@ -696,14 +705,11 @@ VIEWS.overview = {
 };
 function vitalsHTML(s) {
   const peers = s.metrics && s.metrics.peers != null ? s.metrics.peers : s.chains.Nexus && s.chains.Nexus.peers;
-  const m = s.mining;
-  const mining = !m ? '–' : m.running ? 'On' : m.enabled ? 'On, not running' : 'Off';
   const parts = [
     ['Version', s.status && s.status.version], // absent from a node that predates it
     ['Up for', startedAt(s) ? duration(Date.now() - startedAt(s)) : '–'],
     ['Peers', peers == null ? '–' : num(peers)],
     ['Disk free', s.disk ? bytes(s.disk.freeBytes) : '–'],
-    ['Mining', mining],
     ['Waiting transactions', s.status ? num(s.status.mempoolCount) : '–'],
   ];
   return html`<dl class="vitals">${parts.filter(([, v]) => v != null).map(([k, v]) => html`<div><dt>${k}</dt><dd>${v}</dd></div>`)}</dl>`;
@@ -762,8 +768,7 @@ VIEWS.chain = {
     const rate = rateOf(s, path);
     const last = c && c.latest && c.latest.timestamp ? Number(c.latest.timestamp) : null;
     const p = s.progress[path];
-    const cfg = (s.config && s.config.config) || {};
-    const below = chainPaths(s).filter((x) => parentOf(x) === path);
+    const cfg = mergedSpec(s);
     return html`
       <a class="back" href="#/">Overview</a>
       <div class="page-head"><div class="titles"><h1>${lastSegment(path)}</h1><p class="muted">${path.split('/').join(' / ')}</p></div></div>
@@ -785,7 +790,7 @@ VIEWS.chain = {
         <div class="section-head"><h2 id="log-h">Recent log lines about this chain</h2><a class="small" href="#/logs?chain=${encodeURIComponent(path)}">All logs for ${lastSegment(path)}</a></div>
         <div id="chain-log" class="log-mini ${s.logCache && s.logCache[path] && s.logCache[path].length ? '' : 'muted'}">${s.logCache && s.logCache[path] ? (s.logCache[path].length ? s.logCache[path].join('\n') : 'Nothing about this chain in the last 3,000 lines.') : 'Reading the log…'}</div>
       </section>
-      <section aria-labelledby="act-h"><h2 id="act-h">Actions</h2>${chainActions(s, path, below)}</section>
+      <section aria-labelledby="act-h"><h2 id="act-h">Actions</h2>${chainActions(s, path)}</section>
       <details><summary class="small">Identifiers</summary>
         <dl class="facts-grid mt-3">
           <div><dt>Newest block</dt><dd>${cidView(h && h.tipCID)}</dd></div>
@@ -803,7 +808,7 @@ VIEWS.chain = {
       const box = $('#intervals'); if (box) { box.innerHTML = intervalsHTML(page.blocks, s.blockTime[path]).s; mountSpark(box); }
     } catch (e) { const box = $('#intervals'); if (box) box.innerHTML = html`<p class="empty">Couldn't read recent blocks: ${e.message}</p>`.s; }
     try {
-      const text = await get(n, 'logs?file=node&tail=3000', { text: true });
+      const text = await get(n, 'logs?tail=3000', { text: true });
       const lines = text.split('\n').filter((l) => mentions(l, path)).slice(-12);
       s.logCache = { ...(s.logCache || {}), [path]: lines };
       const box = $('#chain-log');
@@ -822,13 +827,31 @@ function mentions(line, path) {
   if (path === 'Nexus') return /Nexus(?![/\w])/.test(line);
   return line.includes(path) && !line.includes(`${path}/`);
 }
-function chainActions(s, path, below) {
+/** Why this page can't stop hosting `path`, or '' when it can: it removes
+ *  the path from the operator layer only, so another layer listing it, or a
+ *  listed chain under it (which hosts its ancestors), keeps it hosted. */
+function unhostBlocked(s, path) {
+  if (s.config && s.config.flags) return 'This node was started with command-line flags; change its flags instead.';
+  const st = chainStatus(s, path);
+  if (!st) return s.config ? "It isn't in this node's configuration." : '';
+  const plain = (list) => list.map((x) => html`<code>${x}</code>`).reduce((a, b) => html`${a}, ${b}`);
+  const keep = (configStatus(s).chains || []).filter((c) => c.path.startsWith(`${path}/`) && c.from.length).map((c) => c.path);
+  if (!st.from.includes(FRAGMENT)) {
+    if (st.impliedBy && st.impliedBy.length) return html`It's hosted because ${plain(st.impliedBy)} under it ${st.impliedBy.length === 1 ? 'is' : 'are'} hosted. Stop hosting ${st.impliedBy.length === 1 ? 'that' : 'those'} first.`;
+    return html`It's listed in the ${plain(st.from)} settings ${st.from.length === 1 ? 'layer' : 'layers'}, not the operator settings this page changes. Remove it there.`;
+  }
+  const others = st.from.filter((f) => f !== FRAGMENT);
+  if (others.length) return html`It's also listed in the ${plain(others)} settings ${others.length === 1 ? 'layer' : 'layers'}, which would keep it hosted. Remove it there too.`;
+  if (keep.length) return html`${plain(keep)} under it ${keep.length === 1 ? 'is' : 'are'} hosted, which keeps it hosted. Stop hosting ${keep.length === 1 ? 'that' : 'those'} first.`;
+  return '';
+}
+function chainActions(s, path) {
   if (path === 'Nexus') return html`<p class="prose">Nexus is the root chain; every node hosts it. To start it over from its peers, see <a href="#/danger">Restart and wipe</a>.</p>`;
-  const blocked = below.length ? `Stop hosting ${below.map(lastSegment).join(', ')} first: a chain below it is hosted.` : '';
+  const blocked = unhostBlocked(s, path);
   return html`<div class="actions">
     <div class="action">
       <div class="grow"><strong>Stop hosting ${lastSegment(path)}</strong><p class="soft small">The node stops following it right away. What it stored stays, so hosting it again resumes where it left off.</p>${blocked ? html`<p class="why-not">${blocked}</p>` : ''}</div>
-      <button type="button" class="danger" data-unhost="${path}" ${raw(blocked || !may('DELETE /hosted-chains') ? 'disabled' : '')}>Stop hosting</button>
+      <button type="button" class="danger" data-unhost="${path}" ${raw(blocked || !may() ? 'disabled' : '')}>Stop hosting</button>
     </div>
     <div class="action">
       <div class="grow"><strong>Commit a block on ${lastSegment(parentOf(path))}</strong>
@@ -836,7 +859,7 @@ function chainActions(s, path, below) {
       <pre class="cmd">lattice child commit ${path} --key ./wallet.json --fee 1 --root &lt;root&gt;</pre></div>
     </div>
   </div>
-  ${writeGuard('stop hosting a chain', 'DELETE /hosted-chains')}`;
+  ${writeGuard('stop hosting a chain')}`;
 }
 
 // Sparkline: one series (seconds between consecutive blocks), with the
@@ -901,7 +924,7 @@ function mountSpark(root) {
 
 // Logs ------------------------------------------------------------------------
 
-const logs = { lines: [], file: 'node', timer: null, follow: true, fresh: 0, filter: '', level: 'all', chain: '', error: null };
+const logs = { lines: [], timer: null, follow: true, fresh: 0, filter: '', level: 'all', chain: '', error: null };
 function leaveLogs() { clearTimeout(logs.timer); logs.timer = null; }
 function lineLevel(l) {
   const m = l.match(/^\S+\s+(trace|debug|info|notice|warning|error|critical)\b/);
@@ -914,14 +937,11 @@ VIEWS.logs = {
   form: true,
   render() {
     const s = snap(); const p = state.route.params;
-    const file = p.file === 'mine' ? 'mine' : 'node';
-    if (logs.file !== file) { logs.lines = []; logs.file = file; }
     if (p.chain !== undefined) logs.chain = p.chain;
     return html`
-      <div class="page-head"><div class="titles"><h1>Logs</h1><p class="muted">The newest lines, kept up to date. Scroll up to pause.</p></div></div>
+      <div class="page-head"><div class="titles"><h1>Logs</h1><p class="muted">The node's newest lines since it last started, kept up to date. Scroll up to pause.</p></div></div>
       ${restartBanner()}
       <div class="log-tools">
-        <div class="seg" role="group" aria-label="Which log"><button type="button" data-logfile="node" aria-pressed="${String(file === 'node')}">Node</button><button type="button" data-logfile="mine" aria-pressed="${String(file === 'mine')}">Miner</button></div>
         <div class="chips" role="group" aria-label="Lines">
           <button type="button" class="chip" data-loglevel="all" aria-pressed="${String(logs.level === 'all')}">All lines</button>
           <button type="button" class="chip" data-loglevel="problems" aria-pressed="${String(logs.level === 'problems')}">Problems only</button>
@@ -933,7 +953,7 @@ VIEWS.logs = {
         <button type="button" class="small" data-logfollow>${logs.follow ? 'Pause' : 'Follow'}</button>
       </div>
       <div class="log-wrap">
-        <div class="logbox" id="logbox" tabindex="0" role="log" aria-label="${file === 'mine' ? 'Miner' : 'Node'} log"></div>
+        <div class="logbox" id="logbox" tabindex="0" role="log" aria-label="Node log"></div>
         <button type="button" class="newlines primary small" data-lognew hidden></button>
       </div>
       <p class="muted small" id="log-status"></p>`;
@@ -956,7 +976,7 @@ async function pollLogs() {
   clearTimeout(logs.timer);
   const n = node();
   try {
-    const text = await get(n, `logs?file=${logs.file}&tail=1500`, { text: true });
+    const text = await get(n, 'logs?tail=1500', { text: true });
     const got = text.split('\n'); if (got[got.length - 1] === '') got.pop();
     let added = got;
     if (logs.lines.length) {
@@ -974,7 +994,7 @@ async function pollLogs() {
     }
     logs.error = null;
   } catch (e) {
-    logs.error = e.status === 404 ? (logs.file === 'mine' ? 'No miner log yet: mining has not run on this node.' : "This node's log goes to its standard output, not a file the dashboard can read.") : `Couldn't read the log: ${e.message}`;
+    logs.error = e.status === 404 ? "This node's log goes to its standard output, not a file the dashboard can read." : `Couldn't read the log: ${e.message}`;
   }
   paintLogMeta();
   if (state.route.name === 'logs') logs.timer = setTimeout(pollLogs, document.hidden ? 10000 : 2000);
@@ -1007,48 +1027,6 @@ function paintLogMeta() {
   if (st) st.textContent = logs.error || (logs.follow ? `Following. ${plural(logs.lines.filter(matchesLog).length, 'line')} shown.` : 'Paused. New lines collect below.');
 }
 
-// Mining ------------------------------------------------------------------------
-
-VIEWS.mining = {
-  render() {
-    const s = snap(); const m = s.mining || {};
-    const cfg = (s.config && s.config.config) || {};
-    const mine = cfg.mine || {};
-    const recipients = m.recipients || mine.recipients || {};
-    const chains = chainPaths(s);
-    const sentence = !s.mining ? 'Reading…'
-      : m.running ? `The miner is running${m.pid ? ` (process ${m.pid})` : ''}.`
-        : m.enabled ? "Mining is on, but the miner isn't running right now." : 'Mining is off.';
-    return html`
-      <div class="page-head"><div class="titles"><h1>Mining</h1><p class="lede sub ${m.enabled && !m.running ? 'warn' : ''}">${sentence}</p></div>
-        ${s.config && !s.config.flags ? html`<button type="button" class="${m.enabled ? '' : 'primary'}" data-mine="${m.enabled ? 'off' : 'on'}" ${disabledUnless('PATCH /config', 'start or stop mining')}>${m.enabled ? 'Stop mining' : 'Start mining'}</button>` : ''}
-      </div>
-      ${restartBanner()}
-      ${writeGuard('start or stop mining')}
-      <dl class="facts-grid">
-        <div><dt>Restarts since the node started</dt><dd>${num(m.restarts || 0)}</dd></div>
-        <div><dt>Last exit</dt><dd>${m.lastExit || html`<small>none</small>`}</dd></div>
-        <div><dt>Workers</dt><dd>${mine.workers ?? html`<small>default</small>`}</dd></div>
-        <div><dt>Least time between blocks</dt><dd>${mine.minBlockIntervalSeconds ? `${mine.minBlockIntervalSeconds} s` : html`<small>none</small>`}</dd></div>
-      </dl>
-      <section aria-labelledby="rec-h">
-        <div class="section-head"><h2 id="rec-h">Who each chain pays</h2>${may() ? html`<a class="small" href="#/settings?focus=mining">Change in Settings</a>` : ''}</div>
-        <ul class="list">${chains.map((c) => html`<li><span class="grow"><strong>${c}</strong></span>${recipients[c] ? cidView(recipients[c]) : html`<span class="muted small">No one: its block reward is burned</span>`}</li>`)}</ul>
-      </section>
-      <section aria-labelledby="ml-h">
-        <div class="section-head"><h2 id="ml-h">Miner log</h2><a class="small" href="#/logs?file=mine">Open the full log</a></div>
-        <div id="mine-log" class="log-mini ${s.mineLog ? '' : 'muted'}">${s.mineLog || 'Reading…'}</div>
-      </section>`;
-  },
-  async mount() {
-    try {
-      const text = await get(node(), 'logs?file=mine&tail=12', { text: true });
-      snap().mineLog = text.trim() || 'Empty.';
-    } catch (e) { snap().mineLog = e.status === 404 ? 'No miner log: mining has not run on this node.' : e.message; }
-    const box = $('#mine-log'); if (box) { box.textContent = snap().mineLog; box.classList.remove('muted'); box.scrollTop = box.scrollHeight; }
-  },
-};
-
 // Storage ----------------------------------------------------------------------
 
 const STORE_GROUPS = [
@@ -1059,7 +1037,7 @@ const STORE_GROUPS = [
 VIEWS.storage = {
   render() {
     const s = snap(); const d = s.disk;
-    const cfg = (s.config && s.config.config) || {};
+    const cfg = mergedSpec(s);
     const groups = [];
     if (d) {
       const by = new Map();
@@ -1106,8 +1084,9 @@ function pinsHTML(c) {
 
 // Settings ------------------------------------------------------------------
 
-const LIVE_KEYS = new Set(['hostedChains', 'peers', 'mine']);
-const settings = { tab: 'form', original: null, draft: null, review: null, result: null, rawError: null, loading: false };
+const LIVE_KEYS = new Set(['hostedChains', 'peers']);
+// original: the operator layer as read; etag: its version, sent back as If-Match.
+const settings = { tab: 'form', original: null, etag: null, draft: null, review: null, result: null, rawError: null };
 function isLive(key, patch) {
   if (key === 'peers') {
     const p = patch && patch.peers;
@@ -1130,6 +1109,15 @@ function mergePatch(from, to) {
   }
   for (const k of Object.keys(from)) if (!(k in to)) patch[k] = null;
   return patch;
+}
+/** `target` with RFC 7396 merge patch `patch` applied. */
+function applyPatch(target, patch) {
+  const out = isPlainObject(target) ? { ...target } : {};
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null) delete out[k];
+    else out[k] = isPlainObject(v) ? applyPatch(out[k], v) : clone(v);
+  }
+  return out;
 }
 function flatten(patch, from, prefix = '') {
   const out = [];
@@ -1179,9 +1167,13 @@ VIEWS.settings = {
     }
     const patch = mergePatch(settings.original, settings.draft || {});
     const changes = flatten(patch, settings.original);
+    const st = configStatus(s);
+    const layers = (s.config && s.config.fragments) || [];
     return html`
-      <div class="page-head"><div class="titles"><h1>Settings</h1><p class="muted">The node's <code>lattice.json</code>. Some changes apply at once; the rest wait for a restart, and each one says which.</p></div></div>
+      <div class="page-head"><div class="titles"><h1>Settings</h1><p class="muted">The node reads <code>lattice.json</code> and then each layer in <code>config.d</code>, in name order${layers.length ? html` (${layers.join(', ')})` : ''}. This page changes the <code>operator</code> layer. A later layer's value wins; lists such as chains and peers combine every layer's. Some changes apply at once; the rest wait for a restart, and each one says which.</p></div></div>
       ${restartBanner()}
+      ${(st.errors || []).length ? html`<div class="banner bad" role="alert">${raw(ICON.bad)}<div class="grow"><strong>The node isn't running the configuration as written.</strong><ul class="failures">${st.errors.map((x) => html`<li>${x}</li>`)}</ul></div></div>` : ''}
+      ${(st.inert || []).length ? html`<div class="banner info" role="status"><div class="grow"><strong>Set but not in use:</strong><ul class="failures">${st.inert.map((x) => html`<li>${x}</li>`)}</ul></div></div>` : ''}
       ${writeGuard('change settings')}
       <div class="tabs" role="tablist"><button type="button" role="tab" data-tab="form" aria-selected="${String(settings.tab === 'form')}">Common settings</button><button type="button" role="tab" data-tab="raw" aria-selected="${String(settings.tab === 'raw')}">Raw JSON</button></div>
       ${settings.result ? resultHTML() : ''}
@@ -1198,13 +1190,30 @@ VIEWS.settings = {
     main.addEventListener('change', onSettingsInput);
   },
 };
-async function loadSettings() {
+/** The operator layer as it is, and its version: {} and null when there is none yet. */
+async function readFragment(n) {
+  const r = await api(n, `config/fragments/${FRAGMENT}`, { accept: [404] });
+  return r.status === 404 ? { body: {}, etag: null } : { body: isPlainObject(r.data) ? r.data : {}, etag: r.etag };
+}
+/** Writes the operator layer only while it is still the version read
+ *  (If-Match), or, read as none, while there still is none (If-None-Match).
+ *  412 when someone else wrote it first. Answers as GET /config. */
+async function putFragment(n, body, etag) {
+  // Hosting a chain starts it before the node answers: give it time.
+  return get(n, `config/fragments/${FRAGMENT}`, { method: 'PUT', body, timeout: 60000, headers: etag ? { 'If-Match': etag } : { 'If-None-Match': '*' } });
+}
+/** Reads the configuration and the operator layer. With keepEdits, unsaved
+ *  edits are carried onto the layer as read, as long as they still apply. */
+async function loadSettings({ keepEdits = false } = {}) {
+  const n = node();
   try {
-    const r = await get(node(), 'config');
-    snap().config = r;
-    settings.original = r.config; settings.draft = clone(r.config); settings.review = null;
+    const [config, frag] = await Promise.all([get(n, 'config'), readFragment(n)]);
+    snap().config = config;
+    const pending = keepEdits && settings.original ? mergePatch(settings.original, settings.draft || {}) : {};
+    settings.original = frag.body; settings.etag = frag.etag;
+    settings.draft = applyPatch(frag.body, pending); settings.review = null;
   } catch (e) { toast(`Couldn't read settings: ${e.message}`); }
-  rerender();
+  if (state.route.name === 'settings') rerender();
 }
 function rerender() {
   const main = $('main'); const view = VIEWS[state.route.name];
@@ -1218,43 +1227,35 @@ function fieldHTML(f) {
   const d = settings.draft || {}; const o = settings.original || {};
   const value = getPath(d, f.key);
   const changed = !deepEqual(value, getPath(o, f.key));
+  const merged = getPath(mergedSpec(snap()), f.key);
+  const elsewhere = merged !== undefined && !deepEqual(merged, getPath(o, f.key));
   const id = `f-${f.key.replace(/\W/g, '-')}`;
   let control;
   if (f.type === 'select') control = html`<select id="${id}" data-key="${f.key}" data-type="select">${f.options.map(([v, l]) => html`<option value="${v}" ${raw((value ?? '') === v ? 'selected' : '')}>${l}</option>`)}</select>`;
   else control = html`<input id="${id}" type="${f.type === 'number' ? 'number' : f.type === 'url' ? 'url' : 'text'}" ${raw(f.type === 'number' ? 'min="0" inputmode="numeric"' : '')} data-key="${f.key}" data-type="${f.type}" value="${value ?? ''}" placeholder="${f.placeholder || ''}">`;
-  return html`<div class="field ${changed ? 'changed' : ''}"><label for="${id}" class="label-line">${f.label}${f.unit ? html`<span class="muted small">${f.unit}</span>` : ''} ${liveTag(f.key)}</label>${control}${f.hint ? html`<span class="hint">${f.hint}</span>` : ''}</div>`;
+  return html`<div class="field ${changed ? 'changed' : ''}"><label for="${id}" class="label-line">${f.label}${f.unit ? html`<span class="muted small">${f.unit}</span>` : ''} ${liveTag(f.key)}</label>${control}${elsewhere ? html`<span class="hint">In effect: ${show(merged)}, set in another layer.</span>` : ''}${f.hint ? html`<span class="hint">${f.hint}</span>` : ''}</div>`;
 }
+const peersOf = (v) => (Array.isArray(v) ? { Nexus: v } : (v || {}));
+/** What other layers add to a list this layer sets: the merged list less this layer's. */
+const fromOthers = (merged, mine) => (merged || []).filter((x) => !(mine || []).includes(x));
 function settingsForm(s) {
   const d = settings.draft || {}; const o = settings.original || {};
-  const hosted = d.hostedChains || [];
-  const peers = Array.isArray(d.peers) ? { Nexus: d.peers } : (d.peers || {});
-  const chains = ['Nexus', ...hosted];
-  const mine = d.mine || {};
+  const spec = mergedSpec(s);
+  const peers = peersOf(d.peers);
+  const chains = ['Nexus', ...(spec.hostedChains || [])];
   const ro = disabledUnless();
   const origins = d.operatorAllowedOrigins || [];
+  const otherOrigins = fromOthers(spec.operatorAllowedOrigins, o.operatorAllowedOrigins);
   return html`
-    <section id="set-chains" aria-labelledby="sc-h">
-      <div class="section-head"><h2 id="sc-h">Chains this node hosts</h2>${liveTag('hostedChains')}</div>
-      <p class="prose small">Nexus is always hosted. A chain added by its path is synced from peers that host it; its parent must be hosted too.</p>
-      <ul class="list">${hosted.length ? hosted.map((c) => html`<li><span class="grow"><strong>${c}</strong>${(o.hostedChains || []).includes(c) ? '' : html` <span class="tag live">new</span>`}</span><button type="button" class="small" data-remove-chain="${c}" ${ro}>Remove</button></li>`) : html`<li class="muted">No chains besides Nexus.</li>`}</ul>
-      <form class="inline" data-add-chain><label class="visually-hidden" for="add-chain">Chain path</label><input id="add-chain" type="text" placeholder="Nexus/Name" spellcheck="false" pattern="Nexus(/[^/\\s]+)+" ${ro}><button type="submit" ${ro}>Add chain</button></form>
-    </section>
-    <section id="set-mining" aria-labelledby="sm-h">
-      <div class="section-head"><h2 id="sm-h">Mining</h2>${liveTag('mine')}</div>
-      <label class="check"><input type="checkbox" data-key="mine.enabled" data-type="bool" ${raw(mine.enabled ? 'checked' : '')} ${ro}> Mine on this node</label>
-      <div class="form-grid">${chains.map((c) => {
-        const id = `rec-${c.replace(/\W/g, '-')}`; const v = (mine.recipients || {})[c] || '';
-        const changed = v !== (((o.mine || {}).recipients || {})[c] || '');
-        return html`<div class="field ${changed ? 'changed' : ''}"><label for="${id}" class="label-line">${c} pays</label><input id="${id}" type="text" spellcheck="false" placeholder="Address (empty burns the reward)" data-key="mine.recipients.${c}" data-type="text" value="${v}" ${ro}></div>`;
-      })}</div>
-    </section>
+    ${chainsSection(s)}
     <section id="set-peers" aria-labelledby="sp-h">
       <div class="section-head"><h2 id="sp-h">Peers</h2></div>
       <p class="prose small">Nodes to connect to, one per line, as <code>publicKey@host:port</code>.</p>
       <div class="form-grid">${chains.map((c) => {
         const id = `peers-${c.replace(/\W/g, '-')}`; const v = (peers[c] || []).join('\n');
-        const was = (Array.isArray(o.peers) ? { Nexus: o.peers } : (o.peers || {}))[c] || [];
-        return html`<div class="field ${same(peers[c] || [], was) ? '' : 'changed'}"><label for="${id}" class="label-line">${c} ${c === 'Nexus' ? html`<span class="tag restart">Needs restart</span>` : html`<span class="tag live">Applies now</span>`}</label><textarea id="${id}" rows="3" data-peers="${c}" spellcheck="false" ${ro}>${v}</textarea></div>`;
+        const was = peersOf(o.peers)[c] || [];
+        const others = fromOthers(peersOf(spec.peers)[c], was);
+        return html`<div class="field ${same(peers[c] || [], was) ? '' : 'changed'}"><label for="${id}" class="label-line">${c} ${c === 'Nexus' ? html`<span class="tag restart">Needs restart</span>` : html`<span class="tag live">Applies now</span>`}</label><textarea id="${id}" rows="3" data-peers="${c}" spellcheck="false" ${ro}>${v}</textarea>${others.length ? html`<span class="hint">Also from other layers: ${others.join(', ')}</span>` : ''}</div>`;
       })}</div>
     </section>
     <section id="set-retention" aria-labelledby="sr-h"><h2 id="sr-h">What the node keeps</h2><div class="form-grid">${FIELDS.filter((f) => f.group === 'retention').map(fieldHTML)}</div></section>
@@ -1262,11 +1263,40 @@ function settingsForm(s) {
     <section id="set-access" aria-labelledby="sa-h">
       <div class="section-head"><h2 id="sa-h">Dashboards allowed to connect</h2>${liveTag('operatorAllowedOrigins')}</div>
       <p class="prose small">A dashboard page can manage this node only if its address is listed here, one per line, exactly as the browser shows it (for example <code>${location.origin}</code>, this page's). Removing this page's address disconnects it.</p>
-      <div class="field ${same(origins, o.operatorAllowedOrigins || []) ? '' : 'changed'}"><label class="visually-hidden" for="origins">Allowed dashboard addresses</label><textarea id="origins" rows="3" data-lines="operatorAllowedOrigins" spellcheck="false" ${ro}>${origins.join('\n')}</textarea></div>
+      <div class="field ${same(origins, o.operatorAllowedOrigins || []) ? '' : 'changed'}"><label class="visually-hidden" for="origins">Allowed dashboard addresses</label><textarea id="origins" rows="3" data-lines="operatorAllowedOrigins" spellcheck="false" ${ro}>${origins.join('\n')}</textarea>${otherOrigins.length ? html`<span class="hint">Also from other layers: ${otherOrigins.join(', ')}</span>` : ''}</div>
+    </section>`;
+}
+/** The chains the configuration hosts, each with what keeps it hosted.
+ *  Hosting, creating and stopping apply at once, apart from the staged edits. */
+function chainsSection(s) {
+  const list = configStatus(s).chains || [];
+  const ro = disabledUnless();
+  const why = (c) => (c.from.length ? html`Listed in ${c.from.join(', ')}` : html`Hosted for ${(c.impliedBy || []).join(', ')}, under it`);
+  return html`<section id="set-chains" aria-labelledby="sc-h">
+      <div class="section-head"><h2 id="sc-h">Chains this node hosts</h2>${liveTag('hostedChains')}</div>
+      <p class="prose small">Nexus is always hosted. Hosting a chain also hosts the chains above it, down from Nexus. A chain is synced from peers that host it, or mined here if it was created on this node. These changes take effect as soon as you make them.</p>
+      <ul class="list">${list.length ? list.map((c) => {
+        const blocked = unhostBlocked(s, c.path);
+        return html`<li><span class="grow"><strong>${c.path}</strong><br><span class="muted small">${why(c)}${c.actual === 'hosted' ? '' : html`. Not running${c.error ? `: ${c.error}` : ''}`}</span>${blocked ? html`<br><span class="why-not">${blocked}</span>` : ''}</span><button type="button" class="small" data-unhost="${c.path}" ${raw(blocked || !may() ? 'disabled' : '')}>Stop hosting</button></li>`;
+      }) : html`<li class="muted">No chains besides Nexus.</li>`}</ul>
+      <form class="inline" data-host-chain><label class="visually-hidden" for="host-chain">Chain path</label><input id="host-chain" type="text" placeholder="Nexus/Name" spellcheck="false" pattern="Nexus(/[^/\\s]+)+" ${ro}><button type="submit" ${ro}>Host chain</button></form>
+      <details><summary class="small">Create a new chain</summary>
+        <form class="stack mt-2" data-create-chain>
+          <p class="prose small">Makes a new chain with its first block mined here, then hosts it. For policies, genesis transactions or a full spec, use <code>lattice child create</code>.</p>
+          <div class="form-grid">
+            <div class="field"><label for="cc-path" class="label-line">Path</label><input id="cc-path" type="text" required placeholder="Nexus/Name" spellcheck="false" pattern="Nexus(/[^/\\s]+)+"></div>
+            <div class="field"><label for="cc-time" class="label-line">Target block time <span class="muted small">ms</span></label><input id="cc-time" type="number" min="1" required value="10000"></div>
+            <div class="field"><label for="cc-reward" class="label-line">Block reward</label><input id="cc-reward" type="number" min="0" required value="1000"></div>
+            <div class="field"><label for="cc-premine" class="label-line">Premine <span class="muted small">blocks of reward</span></label><input id="cc-premine" type="number" min="0" required value="0"></div>
+            <div class="field"><label for="cc-to" class="label-line">Premine paid to</label><input id="cc-to" type="text" spellcheck="false" placeholder="Address (with a premine)"></div>
+          </div>
+          <div><button type="submit" ${raw(may() && may('POST /chains') ? '' : 'disabled title="This token can\'t create chains"')}>Create and host</button></div>
+        </form>
+      </details>
     </section>`;
 }
 function rawForm() {
-  return html`<div class="field"><label for="raw" class="label-line">lattice.json <span class="muted small">edit, then review</span></label>
+  return html`<div class="field"><label for="raw" class="label-line">config.d/operator.json <span class="muted small">edit, then review</span></label>
     <textarea id="raw" rows="24" data-raw spellcheck="false" ${disabledUnless()}>${JSON.stringify(settings.draft, null, 2)}</textarea>
     <span class="error" id="raw-error" role="alert">${settings.rawError || ''}</span></div>`;
 }
@@ -1283,13 +1313,11 @@ function reviewHTML(changes, patch) {
 }
 function resultHTML() {
   const r = settings.result;
-  if (r.error) return html`<div class="banner bad" role="alert">${raw(ICON.bad)}<div class="grow"><strong>Nothing was changed.</strong> ${r.error}</div>${r.conflict && may('POST /restart') ? html`<button type="button" data-restart>Restart to load the file</button>` : ''}<button type="button" class="quiet" data-dismiss-result>Dismiss</button></div>`;
-  const failed = r.failed || [];
-  return html`<div class="banner ${failed.length ? 'bad' : 'info'}" role="status"><div class="grow">
-    ${failed.length ? html`<strong>Part of the change failed.</strong> What failed was left out of the file.` : html`<strong>Saved.</strong>`}
+  if (r.error) return html`<div class="banner bad" role="alert">${raw(ICON.bad)}<div class="grow"><strong>${r.unconfirmed ? 'Not confirmed.' : 'Nothing was changed.'}</strong> ${r.error}</div><button type="button" class="quiet" data-dismiss-result>Dismiss</button></div>`;
+  return html`<div class="banner info" role="status"><div class="grow">
+    <strong>Saved.</strong>
     ${r.applied.length ? html` Applied now: ${r.applied.join(', ')}.` : ''}
     ${r.restartRequired.length ? html` Waiting for a restart: ${r.restartRequired.join(', ')}.` : ''}
-    ${failed.length ? html`<ul class="failures">${failed.map((f) => html`<li><strong>${f.key}${f.chain ? ` (${f.chain})` : ''}</strong>: ${f.error}</li>`)}</ul>` : ''}
   </div><button type="button" class="quiet" data-dismiss-result>Dismiss</button></div>`;
 }
 function onSettingsInput(e) {
@@ -1305,17 +1333,9 @@ function onSettingsInput(e) {
   }
   if (t.dataset.key) {
     let v;
-    if (t.dataset.type === 'bool') v = t.checked;
-    else if (t.dataset.type === 'number') v = t.value === '' ? undefined : Number(t.value);
+    if (t.dataset.type === 'number') v = t.value === '' ? undefined : Number(t.value);
     else v = t.value.trim() === '' ? undefined : t.value.trim();
-    if (t.dataset.key.startsWith('mine.recipients.')) {
-      const chain = t.dataset.key.slice('mine.recipients.'.length);
-      d.mine = d.mine || {}; d.mine.recipients = d.mine.recipients || {};
-      if (v === undefined) delete d.mine.recipients[chain]; else d.mine.recipients[chain] = v;
-      if (!Object.keys(d.mine.recipients).length) delete d.mine.recipients;
-    } else if (t.dataset.type === 'bool' && t.dataset.key === 'mine.enabled') {
-      d.mine = d.mine || {}; d.mine.enabled = v;
-    } else setPath(d, t.dataset.key, v);
+    setPath(d, t.dataset.key, v);
     // A window is only valid with state "recent"; say so in the file.
     if (t.dataset.key === 'stateWindow' && v !== undefined && !d.state) {
       d.state = 'recent';
@@ -1347,36 +1367,53 @@ function paintStaged() {
   if (!bar) { bar = document.createElement('div'); bar.className = 'staged'; bar.setAttribute('role', 'region'); bar.setAttribute('aria-label', 'Unsaved changes'); $('main .page').append(bar); }
   bar.innerHTML = markup;
 }
-function removeChainFromDraft(path) {
-  const d = settings.draft;
-  const gone = (c) => c === path || c.startsWith(`${path}/`);
-  d.hostedChains = (d.hostedChains || []).filter((c) => !gone(c));
-  if (!d.hostedChains.length) delete d.hostedChains;
-  for (const key of ['stateWindows', 'finalityWindows']) {
-    if (isPlainObject(d[key])) { for (const c of Object.keys(d[key])) if (gone(c)) delete d[key][c]; if (!Object.keys(d[key]).length) delete d[key]; }
-  }
-  if (isPlainObject(d.peers)) { for (const c of Object.keys(d.peers)) if (gone(c)) delete d.peers[c]; }
-  if (d.mine) for (const key of ['recipients', 'minWork']) {
-    if (isPlainObject(d.mine[key])) { for (const c of Object.keys(d.mine[key])) if (gone(c)) delete d.mine[key][c]; if (!Object.keys(d.mine[key]).length) delete d.mine[key]; }
-  }
-}
 async function applySettings() {
   const patch = mergePatch(settings.original, settings.draft);
   const btn = $('[data-apply]'); if (btn) { btn.disabled = true; btn.textContent = 'Applying…'; }
   try {
-    const r = await api(node(), 'config', { method: 'PATCH', body: patch, contentType: 'application/merge-patch+json', accept: [500] });
-    const body = r.data;
-    settings.result = { applied: body.applied || [], failed: body.failed || [], restartRequired: body.restartRequired || [] };
-    settings.original = body.config; settings.draft = clone(body.config); settings.review = null;
-    snap().config = { config: body.config, restartRequired: body.restartRequired || [] };
-    toast(body.failed && body.failed.length ? 'Part of the change failed' : 'Settings saved');
+    const config = await putFragment(node(), settings.draft, settings.etag);
+    snap().config = config;
+    settings.result = { applied: Object.keys(patch).filter((k) => isLive(k, patch)), restartRequired: (config.status && config.status.pendingRestart) || [] };
+    toast('Settings saved');
+    await loadSettings();
   } catch (e) {
-    settings.result = { error: e.status === 409 ? "lattice.json was edited by hand since the node last wrote it. Restart the node to load that edit, then make this change again." : e.message, conflict: e.status === 409 };
-    settings.review = null;
+    if (e.status === 412) {
+      settings.result = { error: 'Someone else changed these settings since this page read them (another dashboard, or lattice config set). They are reloaded below with that change. Make yours again.' };
+      await loadSettings();
+    } else {
+      settings.result = e.timedOut ? { error: 'The node did not answer in time. The change may still apply; reload this page to see what it reports.', unconfirmed: true } : { error: e.message };
+      settings.review = null;
+    }
   }
   rerender();
   paintChrome();
   refresh(state.current);
+}
+
+/** Hosting changes, made at once: the operator layer is read, changed by
+ *  `edit` and written back only if no one wrote it in between. Unsaved
+ *  edits on the Settings page are kept. */
+async function changeHosting(edit, done) {
+  const n = node();
+  try {
+    const { body, etag } = await readFragment(n);
+    const next = clone(body);
+    edit(next);
+    snap().config = await putFragment(n, next, etag);
+    toast(done);
+  } catch (e) {
+    toast(e.status === 412 ? 'Someone else changed the operator settings at the same moment. Nothing was changed; try again.'
+      : e.timedOut ? 'The node did not answer in time. The change may still apply; this page shows what it reports.' : `Nothing was changed: ${e.message}`);
+    return false;
+  } finally {
+    if (settings.original) await loadSettings({ keepEdits: true });
+    refresh(state.current);
+  }
+  return true;
+}
+const sortChains = (list) => list.sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
+function hostPath(path) {
+  return changeHosting((f) => { f.hostedChains = sortChains([...new Set([...(f.hostedChains || []), path])]); }, `Hosting ${path}`);
 }
 
 // Access (tokens) -------------------------------------------------------------
@@ -1399,7 +1436,7 @@ VIEWS.access = {
             <label><input type="radio" name="role" value="read"> <span><strong>Look, not change</strong><br><span class="soft small">Every read, nothing that changes the node.</span></span></label>
             <label><input type="radio" name="role" value="routes"> <span><strong>Use only some routes</strong><br><span class="soft small">For a program that needs one or two things.</span></span></label>
           </fieldset>
-          <div class="field" id="routes-field" hidden><label for="tok-routes" class="label-line">Routes, one per line</label><textarea id="tok-routes" rows="3" placeholder="GET /hosted-chains&#10;POST /hosted-chains" spellcheck="false"></textarea></div>
+          <div class="field" id="routes-field" hidden><label for="tok-routes" class="label-line">Routes, one per line</label><textarea id="tok-routes" rows="3" placeholder="GET /config&#10;PUT /config/fragments/hostmarket" spellcheck="false"></textarea></div>
           <div><button class="primary" type="submit">Make token</button></div>
         </form>
       </section>`}
@@ -1411,7 +1448,7 @@ VIEWS.access = {
   mount() { const w = snap().who; if (!w || w.role === 'admin') loadTokens(); },
 };
 function originsSentence(s) {
-  const list = (s.config && s.config.config && s.config.config.operatorAllowedOrigins) || [];
+  const list = mergedSpec(s).operatorAllowedOrigins || [];
   return list.length ? `Dashboards at ${list.join(', ')} may connect.` : 'No dashboard is listed; a browser page cannot connect.';
 }
 async function loadTokens() {
@@ -1434,16 +1471,22 @@ VIEWS.danger = {
     return html`
       <div class="page-head"><div class="titles"><h1>Restart and wipe</h1></div></div>
       ${restartBanner()}
-      ${!may('POST /restart') && !may('POST /wipe') ? writeGuard('restart or wipe this node', 'POST /restart') : html`${writeGuard('restart this node', 'POST /restart')}${writeGuard('wipe this node', 'POST /wipe')}`}
+      ${!may('POST /restart') && !may('POST /stop') && !may('POST /wipe') ? writeGuard('restart, stop or wipe this node', 'POST /restart') : html`${writeGuard('restart this node', 'POST /restart')}${writeGuard('stop this node', 'POST /stop')}${writeGuard('wipe this node', 'POST /wipe')}`}
+      <p class="prose">The node never starts itself. When it's asked to restart, it exits and whatever runs it (systemd, launchd, Docker, the desktop app) starts it again. A node run by hand, such as <code>lattice up</code> in a terminal, has nothing to start it again: after a restart or a wipe it stays stopped until someone starts it.</p>
       <section aria-labelledby="rs-h">
         <h2 id="rs-h">Restart the node</h2>
-        <p class="prose">The node stops and starts again in the same process, reading its settings afresh. It's offline for about ${restartSeconds()} seconds; every chain then resumes where it was.${restartKeys(s).length ? ` This applies ${restartKeys(s).join(', ')}.` : ''}</p>
+        <p class="prose">The node exits and its process manager starts it again, reading its settings afresh. It's offline for about ${restartSeconds()} seconds; every chain then resumes where it was.${restartKeys(s).length ? ` This applies ${restartKeys(s).join(', ')}.` : ''}</p>
         <div><button type="button" data-restart ${disabledUnless('POST /restart', 'restart the node')}>Restart…</button></div>
+      </section>
+      <section aria-labelledby="st-h" class="ruled">
+        <h2 id="st-h">Stop the node</h2>
+        <p class="prose">The node exits and its process manager leaves it stopped. This page can't start it again: start it on its machine (<code>lattice up</code>, or its service).</p>
+        <div><button type="button" class="danger" data-stop ${disabledUnless('POST /stop', 'stop the node')}>Stop…</button></div>
       </section>
       <section aria-labelledby="wp-h" class="ruled">
         <h2 id="wp-h">Wipe chain data</h2>
         <div class="prose"><p>Deletes everything this node stored for every chain, then restarts. It downloads Nexus again from its peers, and each hosted chain from that chain's peers. That can take a long time.</p>
-        <p><strong>Kept:</strong> the node's identity, its settings, chain specs, tokens and logs. <strong>Deleted:</strong> blocks, state, and pinned content.</p></div>
+        <p><strong>Kept:</strong> the node's identity, its settings, chain specs and tokens. <strong>Deleted:</strong> blocks, state, and pinned content.</p></div>
         <div><button type="button" class="danger" data-wipe ${disabledUnless('POST /wipe', 'wipe the node')} ${raw(s.config && s.config.flags ? 'disabled' : '')}>Wipe…</button></div>
         ${s.config && s.config.flags ? html`<p class="why-not">A wipe needs a node started with <code>lattice up</code>.</p>` : ''}
       </section>
@@ -1536,8 +1579,8 @@ async function waitForNewProcess({ before, startOf, health, deadline, offline = 
 async function restartFlow({ wipe = false } = {}) {
   const n = node();
   const ok = wipe
-    ? await dialog({ title: `Wipe ${n.name}?`, body: html`<p class="soft">Every chain's blocks, state and pinned content on this node are deleted, and it restarts empty. It downloads everything again from its peers. Identity, settings, specs, tokens and logs stay.</p>`, confirm: 'Wipe and restart', danger: true, typed: n.name })
-    : await dialog({ title: `Restart ${n.name}?`, body: html`<p class="soft">It's offline for about ${restartSeconds()} seconds while it restarts. Every chain resumes where it was${snap().mining && snap().mining.enabled ? ', and mining starts again' : ''}.${restartKeys(snap()).length ? ` It then uses the saved ${restartKeys(snap()).join(', ')}.` : ''}</p>`, confirm: 'Restart' });
+    ? await dialog({ title: `Wipe ${n.name}?`, body: html`<p class="soft">Every chain's blocks, state and pinned content on this node are deleted, and it restarts empty. It downloads everything again from its peers. Identity, settings, specs and tokens stay. Without a process manager to start it again, it stays stopped.</p>`, confirm: 'Wipe and restart', danger: true, typed: n.name })
+    : await dialog({ title: `Restart ${n.name}?`, body: html`<p class="soft">It's offline for about ${restartSeconds()} seconds while its process manager starts it again. Every chain resumes where it was.${restartKeys(snap()).length ? ` It then uses the saved ${restartKeys(snap()).join(', ')}.` : ''} Without a process manager, it stays stopped.</p>`, confirm: 'Restart' });
   if (!ok) return;
   const startOf = async () => {
     const st = startMs((await get(n, 'status', { timeout: 2000 })).startedAt);
@@ -1562,7 +1605,7 @@ async function restartFlow({ wipe = false } = {}) {
   overlay.close(); overlay.remove();
   const took = Math.max(2, Math.round((Date.now() - started) / 1000));
   if (back && !wipe) lset(`lattice.dashboard.restart.${n.id}`, took);
-  if (!back) { toast("The node hasn't come back after 3 minutes. Check its log or supervisor."); return; }
+  if (!back) { toast("The node hasn't come back after 3 minutes. If nothing restarts it (no process manager), start it on its machine; otherwise check its process manager's log."); return; }
   if (cookieChanged) {
     // The loopback cookie changes at every start.
     try { await get(n, 'status'); } catch (e) { if (e.status === 401) { n.token = null; signInReason = 'The node restarted and made a new cookie. Paste the new one.'; saveNodes(); paint(true); return; } }
@@ -1572,6 +1615,19 @@ async function restartFlow({ wipe = false } = {}) {
   toast(wipe ? `Wiped. ${n.name} is syncing again from its peers.` : `Restarted in ${took} s.`);
   await refresh(n.id);
   paint(true);
+}
+
+async function stopFlow() {
+  const n = node();
+  if (!await dialog({ title: `Stop ${n.name}?`, body: html`<p class="soft">It exits and stays stopped: this page can't start it again. Start it on its machine with <code>lattice up</code> or its service.</p>`, confirm: 'Stop', danger: true, typed: n.name })) return;
+  try { await api(n, 'stop', { method: 'POST', body: {} }); } catch (e) { toast(`Stop refused: ${e.message}`); return; }
+  const started = Date.now();
+  // Stopped once nothing answers.
+  while (Date.now() - started < 60000) {
+    try { await api(n, 'health', { timeout: 2000 }); } catch (e) { if ((e.status === 0 && !e.timedOut) || e.status >= 500) { toast(`${n.name} stopped.`); refresh(n.id); return; } }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  toast(`${n.name} still answers a minute after it was asked to stop. Check its log.`);
 }
 
 // ---------------------------------------------------------------- events
@@ -1585,29 +1641,21 @@ document.addEventListener('click', async (e) => {
   if ('signoutAll' in ds) { signOutAll(); return; }
   if ('restart' in ds) { restartFlow(); return; }
   if ('wipe' in ds) { restartFlow({ wipe: true }); return; }
+  if ('stop' in ds) { stopFlow(); return; }
   if (ds.action === 'retry') { refresh(state.current); return; }
   if ('gotoFleet' in ds) { location.hash = '#/nodes'; return; }
   if (ds.switchTo) { switchTo(ds.switchTo); return; }
-  if (ds.logfile) { location.hash = `#/logs?file=${ds.logfile}`; return; }
   if (ds.loglevel) { logs.level = ds.loglevel; $$('[data-loglevel]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.loglevel === logs.level))); paintLog(); paintLogMeta(); return; }
   if ('logfollow' in ds) { logs.follow = !logs.follow; if (logs.follow) { logs.fresh = 0; paintLog(); } paintLogMeta(); return; }
   if ('lognew' in ds) { logs.follow = true; logs.fresh = 0; paintLog(); paintLogMeta(); return; }
-  if (ds.mine) {
-    try {
-      await api(node(), 'config', { method: 'PATCH', body: { mine: { enabled: ds.mine === 'on' } }, contentType: 'application/merge-patch+json' });
-      toast(ds.mine === 'on' ? 'Mining started' : 'Mining stopped'); settings.original = null;
-    } catch (err) { toast(err.status === 409 ? 'lattice.json was edited by hand; restart the node first.' : `Couldn't change mining: ${err.message}`); }
-    await refresh(state.current); paint(true); return;
-  }
   if (ds.unhost) {
     const path = ds.unhost;
-    if (!await dialog({ title: `Stop hosting ${lastSegment(path)}?`, body: html`<p class="soft">This node stops following ${path} now and drops it from its settings, with the recipient and peers set for it. What it stored stays: hosting it again resumes it.</p>`, confirm: 'Stop hosting', danger: true })) return;
-    try {
-      const r = await api(node(), `hosted-chains?chainPath=${encodeURIComponent(path)}`, { method: 'DELETE', accept: [500] });
-      toast(r.data.failed && r.data.failed.length ? `Part of it failed: ${r.data.failed[0].error}` : `Stopped hosting ${path}`);
-      settings.original = null;
-      await refresh(state.current); location.hash = '#/';
-    } catch (err) { toast(`Couldn't stop hosting: ${err.message}`); }
+    if (!await dialog({ title: `Stop hosting ${lastSegment(path)}?`, body: html`<p class="soft">This node stops following ${path} now and drops it from the operator settings. Peers set for it stay, unused. What it stored stays: hosting it again resumes it.</p>`, confirm: 'Stop hosting', danger: true })) return;
+    const ok = await changeHosting((f) => {
+      f.hostedChains = (f.hostedChains || []).filter((c) => c !== path);
+      if (!f.hostedChains.length) delete f.hostedChains;
+    }, `Stopped hosting ${path}`);
+    if (ok && state.route.name === 'chain') location.hash = '#/';
     return;
   }
   if (ds.unpin) {
@@ -1634,7 +1682,6 @@ document.addEventListener('click', async (e) => {
   if ('discard' in ds) { settings.draft = clone(settings.original); settings.review = null; settings.rawError = null; rerender(); return; }
   if ('apply' in ds) { applySettings(); return; }
   if ('dismissResult' in ds) { settings.result = null; rerender(); return; }
-  if (ds.removeChain) { removeChainFromDraft(ds.removeChain); rerender(); return; }
 });
 
 document.addEventListener('change', (e) => {
@@ -1645,16 +1692,31 @@ document.addEventListener('change', (e) => {
 document.addEventListener('submit', async (e) => {
   const f = e.target;
   if (f.id === 'signin') { e.preventDefault(); signIn($('#token').value, $('#remember').checked); return; }
-  if (f.matches('[data-add-chain]')) {
+  if (f.matches('[data-host-chain]')) {
     e.preventDefault();
-    const input = $('#add-chain'); const path = input.value.trim().replace(/\/+$/, '');
-    const d = settings.draft; const hosted = d.hostedChains || [];
+    const path = $('#host-chain').value.trim().replace(/\/+$/, '');
     if (!/^Nexus(\/[^/\s]+)+$/.test(path)) { toast('A chain path starts with Nexus/, like Nexus/Name'); return; }
-    if (hosted.includes(path)) { toast(`${path} is already listed`); return; }
-    const parent = parentOf(path);
-    if (parent !== 'Nexus' && !hosted.includes(parent)) { toast(`Host ${parent} first: a chain's parent must be hosted`); return; }
-    d.hostedChains = [...hosted, path].sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
-    rerender(); const again = $('#add-chain'); if (again) again.focus();
+    const st = chainStatus(snap(), path);
+    if (st && st.from.includes(FRAGMENT)) { toast(`${path} is already hosted`); return; }
+    if (await hostPath(path)) { const again = $('#host-chain'); if (again) again.focus(); }
+    return;
+  }
+  if (f.matches('[data-create-chain]')) {
+    e.preventDefault();
+    const path = $('#cc-path').value.trim().replace(/\/+$/, '');
+    if (!/^Nexus(\/[^/\s]+)+$/.test(path)) { toast('A chain path starts with Nexus/, like Nexus/Name'); return; }
+    const premine = Number($('#cc-premine').value); const to = $('#cc-to').value.trim();
+    if (premine > 0 && !to) { toast('A premine is paid to an address: give one'); return; }
+    // The spec `lattice child create` makes from the same choices.
+    const spec = {
+      maxNumberOfTransactionsPerBlock: 1000, maxStateGrowth: 1000000, maxBlockSize: 1000000,
+      premine, targetBlockTime: Number($('#cc-time').value), initialReward: Number($('#cc-reward').value),
+      halvingInterval: 1000000, halfLife: 100, wasmPolicies: [],
+    };
+    try {
+      await get(node(), 'chains', { method: 'POST', body: { path, spec, ...(premine > 0 ? { premineTo: to } : {}) } });
+    } catch (err) { toast(`Couldn't create ${path}: ${err.message}`); return; }
+    if (await hostPath(path)) f.reset();
     return;
   }
   if (f.id === 'new-token') {

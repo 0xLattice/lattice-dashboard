@@ -1,7 +1,7 @@
 # Lattice dashboard
 
-A web page for running Lattice nodes: chain health, logs, mining, storage,
-settings, tokens, restart and wipe. It is a client of a node's operator API.
+A web page for running Lattice nodes: chain health, logs, storage, settings,
+hosted chains, tokens, restart, stop and wipe. It is a client of a node's operator API.
 It is three static files (`index.html`, `dashboard.js`, `dashboard.css`) with
 no dependencies and no build step. The node does not serve it.
 
@@ -63,8 +63,22 @@ URL and token.
 ## What it uses from the node
 
 The page uses the operator API (`/status`, `/health`, `/hosted-chains`,
-`/config`, `/mining`, `/logs`, `/disk`, `/metrics`, `/tokens`, `/pins`,
-`/restart`, `/wipe`) and the read API (`/api/...`). Older nodes may lack
+`/config`, `/config/fragments/operator`, `/chains`, `/logs`, `/disk`,
+`/metrics`, `/tokens`, `/pins`, `/restart`, `/stop`, `/wipe`) and the read
+API (`/api/...`).
+
+Settings and hosting change the node's `operator` configuration layer
+(`config.d/operator.json`), written only while it is still the version the
+page read; when someone else changed it first, the page reloads it and says
+so. The page shows the merged configuration beside it, and for each hosted
+chain the layers that list it or the chain under it that keeps it hosted.
+A chain another layer lists, or that a listed chain under it keeps hosted,
+can't be stopped from here.
+
+Restart and wipe make the node exit for its process manager (systemd,
+launchd, Docker, the desktop app) to start again; the page waits for its
+start time to change. A node with nothing to start it again stays stopped.
+Mining is a separate process (`lattice mine`) and is not shown here. Older nodes may lack
 some newer routes, and the page works around each one:
 
 - **`GET /whoami`**: without it, every write is offered and the node's
@@ -73,3 +87,6 @@ some newer routes, and the page works around each one:
   not shown, and uptime and restart detection use `/metrics`.
 - **No start time from either route**: a restart counts as done once the
   node has been seen down and then answers again.
+- **Configuration layers** (`/config/fragments/...`, `POST /chains`):
+  a node from before them can't have its settings or hosted chains
+  changed from this page; use the `lattice` command that came with it.
