@@ -72,8 +72,9 @@ Settings and hosting change the node's `operator` configuration layer
 page read; when someone else changed it first, the page reloads it and says
 so. The page shows the merged configuration beside it, and for each hosted
 chain the layers that list it or the chain under it that keeps it hosted.
-A chain another layer lists, or that a listed chain under it keeps hosted,
-can't be stopped from here.
+Stop hosting drops the `operator` layer's listing only, as
+`lattice child unhost` does: a chain another layer lists, or that a listed
+chain under it keeps hosted, stays hosted, and the page says so.
 
 Restart and wipe make the node exit for its process manager (systemd,
 launchd, Docker, the desktop app) to start again; the page waits for its

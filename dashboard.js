@@ -425,7 +425,11 @@ function chainPaths(s) {
   for (const c of (s.hosted && s.hosted.configured) || []) set.add(c);
   return [...set].sort((a, b) => a.localeCompare(b));
 }
-const configStatus = (s) => (s.config && s.config.status) || {};
+/** GET /config status, each chain with its `from` list even when absent. */
+function configStatus(s) {
+  const st = (s.config && s.config.status) || {};
+  return { ...st, chains: (st.chains || []).map((c) => ({ ...c, from: c.from || [] })) };
+}
 const restartKeys = (s) => configStatus(s).pendingRestart || [];
 /** The merged configuration (GET /config spec): what every layer says together. */
 const mergedSpec = (s) => (s.config && s.config.spec) || {};
@@ -476,10 +480,17 @@ function paint(navigated = false) {
     return;
   }
   const scroll = navigated ? 0 : window.scrollY;
-  main.innerHTML = `<div class="page">${view.render().s}</div>`;
+  main.innerHTML = `<div class="page">${renderView(view).s}</div>`;
   applyWidths(main);
   if (view.mount) view.mount(main);
   if (navigated) { window.scrollTo(0, 0); const h = $('h1', main); if (h) { h.tabIndex = -1; h.focus({ preventScroll: true }); } } else window.scrollTo(0, scroll);
+}
+/** A view's markup; one the page can't draw says so instead of blanking the page. */
+function renderView(view) {
+  try { return view.render(); } catch (e) {
+    console.error(e);
+    return html`<div class="banner bad" role="alert">${raw(ICON.bad)}<div class="grow"><strong>This page couldn't be shown.</strong> The node said something it didn't expect (${e.message}). The other pages still work.</div></div>`;
+  }
 }
 function applyWidths(root) { for (const el of $$('[data-w]', root)) el.style.width = el.dataset.w; }
 
@@ -551,28 +562,32 @@ function restartBanner() {
 /** The settings layer this page writes: config.d/operator.json, the one
  *  people and `lattice config set` write. */
 const FRAGMENT = 'operator';
-const WRITE = `PUT /config/fragments/${FRAGMENT}`;
-/** Whether a listed route ("METHOD /path", a parameter in braces, as GET
- *  /whoami lists it) allows `route`: `PUT /config/fragments/{name}` allows
- *  `PUT /config/fragments/operator`. */
-function routeAllows(listed, route) {
-  const [m1, p1 = ''] = listed.split(' '); const [m2, p2 = ''] = route.split(' ');
-  if (m1.toUpperCase() !== m2) return false;
-  const a = p1.split('/'); const b = p2.split('/');
-  return a.length === b.length && a.every((seg, i) => seg === b[i] || /^\{.+\}$/.test(seg));
-}
-/** Whether this credential may make `route`. Unknown until /whoami answers:
- *  offered, and the node decides. */
-function may(route = WRITE) {
+const FRAGMENT_ROUTE = '/config/fragments/{name}';
+const FRAGMENT_PATH = `/config/fragments/${FRAGMENT}`;
+/** Whether this credential may make `route` (`METHOD /pattern`, as the node
+ *  registers it, a parameter in braces), or, with `concrete`, that one
+ *  request path. As the node checks a route list: the listed route is the
+ *  pattern verbatim or the concrete path, its method in any case. Unknown
+ *  until /whoami answers: offered, and the node decides. */
+function allows(route, concrete) {
   const who = snap().who;
   if (!who || who.role === 'admin') return true;
   if (who.role === 'read') return false;
-  return (who.routes || []).some((r) => routeAllows(r, route));
+  return (who.routes || []).some((r) => {
+    const listed = r.replace(/^\S+/, (m) => m.toUpperCase());
+    return listed === route || (concrete !== undefined && listed === concrete);
+  });
 }
-function writeGuard(action, route = WRITE) {
+/** `may(route)`: that route. `may()`: changing the operator layer, which
+ *  takes reading it (its version) and writing it. */
+function may(route) {
+  if (route !== undefined) return allows(route);
+  return allows(`PUT ${FRAGMENT_ROUTE}`, `PUT ${FRAGMENT_PATH}`) && allows(`GET ${FRAGMENT_ROUTE}`, `GET ${FRAGMENT_PATH}`);
+}
+function writeGuard(action, route) {
   return may(route) ? '' : html`<p class="why-not">This ${snap().who.role === 'read' ? 'read-only token' : 'token'} can't ${action}.</p>`;
 }
-const disabledUnless = (route = WRITE, action = 'change settings') => raw(may(route) ? '' : `disabled title="This token can't ${action}"`);
+const disabledUnless = (route, action = 'change settings') => raw(may(route) ? '' : `disabled title="This token can't ${action}"`);
 function restartBannerInner() {
   const keys = restartKeys(snap());
   if (!keys.length) return '';
@@ -827,30 +842,36 @@ function mentions(line, path) {
   if (path === 'Nexus') return /Nexus(?![/\w])/.test(line);
   return line.includes(path) && !line.includes(`${path}/`);
 }
-/** Why this page can't stop hosting `path`, or '' when it can: it removes
- *  the path from the operator layer only, so another layer listing it, or a
- *  listed chain under it (which hosts its ancestors), keeps it hosted. */
+const codeList = (list) => list.map((x) => html`<code>${x}</code>`).reduce((a, b, i) => (i ? html`${a}, ${b}` : b), raw(''));
+/** Why this page can't stop hosting `path`, or '' when it can. Like
+ *  `lattice child unhost`, it drops the operator layer's listing only, so
+ *  it needs one to drop. */
 function unhostBlocked(s, path) {
   if (s.config && s.config.flags) return 'This node was started with command-line flags; change its flags instead.';
   const st = chainStatus(s, path);
   if (!st) return s.config ? "It isn't in this node's configuration." : '';
-  const plain = (list) => list.map((x) => html`<code>${x}</code>`).reduce((a, b) => html`${a}, ${b}`);
-  const keep = (configStatus(s).chains || []).filter((c) => c.path.startsWith(`${path}/`) && c.from.length).map((c) => c.path);
-  if (!st.from.includes(FRAGMENT)) {
-    if (st.impliedBy && st.impliedBy.length) return html`It's hosted because ${plain(st.impliedBy)} under it ${st.impliedBy.length === 1 ? 'is' : 'are'} hosted. Stop hosting ${st.impliedBy.length === 1 ? 'that' : 'those'} first.`;
-    return html`It's listed in the ${plain(st.from)} settings ${st.from.length === 1 ? 'layer' : 'layers'}, not the operator settings this page changes. Remove it there.`;
-  }
+  if (st.from.includes(FRAGMENT)) return '';
+  if (st.impliedBy && st.impliedBy.length) return html`It's hosted for ${codeList(st.impliedBy)} under it. Stop hosting ${st.impliedBy.length === 1 ? 'that' : 'those'} instead.`;
+  if (st.from.length) return html`It's listed in the ${codeList(st.from)} settings ${st.from.length === 1 ? 'layer' : 'layers'}, not the operator settings this page changes. Remove it there.`;
+  return html`It's no longer in the configuration but did not stop${st.error ? `: ${st.error}` : ''}. Restarting the node stops it.`;
+}
+/** What keeps `path` hosted once the operator layer no longer lists it:
+ *  another layer listing it, or a listed chain under it. '' when nothing. */
+function stillHostedFor(s, path) {
+  const st = chainStatus(s, path);
+  if (!st) return '';
   const others = st.from.filter((f) => f !== FRAGMENT);
-  if (others.length) return html`It's also listed in the ${plain(others)} settings ${others.length === 1 ? 'layer' : 'layers'}, which would keep it hosted. Remove it there too.`;
-  if (keep.length) return html`${plain(keep)} under it ${keep.length === 1 ? 'is' : 'are'} hosted, which keeps it hosted. Stop hosting ${keep.length === 1 ? 'that' : 'those'} first.`;
-  return '';
+  if (others.length) return `still listed in ${others.join(', ')}`;
+  const below = (configStatus(s).chains || []).filter((c) => c.path.startsWith(`${path}/`) && c.from.length).map((c) => c.path);
+  return below.length ? `still hosted for ${below.join(', ')} under it` : '';
 }
 function chainActions(s, path) {
   if (path === 'Nexus') return html`<p class="prose">Nexus is the root chain; every node hosts it. To start it over from its peers, see <a href="#/danger">Restart and wipe</a>.</p>`;
   const blocked = unhostBlocked(s, path);
+  const kept = blocked ? '' : stillHostedFor(s, path);
   return html`<div class="actions">
     <div class="action">
-      <div class="grow"><strong>Stop hosting ${lastSegment(path)}</strong><p class="soft small">The node stops following it right away. What it stored stays, so hosting it again resumes where it left off.</p>${blocked ? html`<p class="why-not">${blocked}</p>` : ''}</div>
+      <div class="grow"><strong>Stop hosting ${lastSegment(path)}</strong><p class="soft small">The node stops following it right away. What it stored stays, so hosting it again resumes where it left off.</p>${blocked ? html`<p class="why-not">${blocked}</p>` : ''}${kept ? html`<p class="why-not">Dropping this listing leaves it ${kept}.</p>` : ''}</div>
       <button type="button" class="danger" data-unhost="${path}" ${raw(blocked || !may() ? 'disabled' : '')}>Stop hosting</button>
     </div>
     <div class="action">
@@ -1189,6 +1210,11 @@ VIEWS.settings = {
     main.addEventListener('input', onSettingsInput);
     main.addEventListener('change', onSettingsInput);
   },
+  // Opened before the first read of the node answered: read it once it has.
+  update() {
+    const s = snap();
+    if (!settings.original && !settings.loading && s.config && !s.config.flags) loadSettings();
+  },
 };
 /** The operator layer as it is, and its version: {} and null when there is none yet. */
 async function readFragment(n) {
@@ -1206,6 +1232,7 @@ async function putFragment(n, body, etag) {
  *  edits are carried onto the layer as read, as long as they still apply. */
 async function loadSettings({ keepEdits = false } = {}) {
   const n = node();
+  settings.loading = true;
   try {
     const [config, frag] = await Promise.all([get(n, 'config'), readFragment(n)]);
     snap().config = config;
@@ -1213,13 +1240,14 @@ async function loadSettings({ keepEdits = false } = {}) {
     settings.original = frag.body; settings.etag = frag.etag;
     settings.draft = applyPatch(frag.body, pending); settings.review = null;
   } catch (e) { toast(`Couldn't read settings: ${e.message}`); }
+  settings.loading = false;
   if (state.route.name === 'settings') rerender();
 }
 function rerender() {
   const main = $('main'); const view = VIEWS[state.route.name];
   if (!main || !view) return;
   const y = window.scrollY;
-  main.innerHTML = `<div class="page">${view.render().s}</div>`;
+  main.innerHTML = `<div class="page">${renderView(view).s}</div>`;
   applyWidths(main);
   window.scrollTo(0, y);
 }
@@ -1271,13 +1299,16 @@ function settingsForm(s) {
 function chainsSection(s) {
   const list = configStatus(s).chains || [];
   const ro = disabledUnless();
-  const why = (c) => (c.from.length ? html`Listed in ${c.from.join(', ')}` : html`Hosted for ${(c.impliedBy || []).join(', ')}, under it`);
+  const why = (c) => (c.from.length ? html`Listed in ${c.from.join(', ')}`
+    : c.impliedBy && c.impliedBy.length ? html`Hosted for ${c.impliedBy.join(', ')}, under it`
+      : html`No longer configured`);
   return html`<section id="set-chains" aria-labelledby="sc-h">
       <div class="section-head"><h2 id="sc-h">Chains this node hosts</h2>${liveTag('hostedChains')}</div>
       <p class="prose small">Nexus is always hosted. Hosting a chain also hosts the chains above it, down from Nexus. A chain is synced from peers that host it, or mined here if it was created on this node. These changes take effect as soon as you make them.</p>
       <ul class="list">${list.length ? list.map((c) => {
         const blocked = unhostBlocked(s, c.path);
-        return html`<li><span class="grow"><strong>${c.path}</strong><br><span class="muted small">${why(c)}${c.actual === 'hosted' ? '' : html`. Not running${c.error ? `: ${c.error}` : ''}`}</span>${blocked ? html`<br><span class="why-not">${blocked}</span>` : ''}</span><button type="button" class="small" data-unhost="${c.path}" ${raw(blocked || !may() ? 'disabled' : '')}>Stop hosting</button></li>`;
+        const kept = blocked ? '' : stillHostedFor(s, c.path);
+        return html`<li><span class="grow"><strong>${c.path}</strong><br><span class="muted small">${why(c)}${c.actual === 'hosted' ? '' : html`. Not running`}${c.error ? `: ${c.error}` : ''}</span>${blocked ? html`<br><span class="why-not">${blocked}</span>` : ''}${kept ? html`<br><span class="why-not">Stopping here leaves it ${kept}.</span>` : ''}</span><button type="button" class="small" data-unhost="${c.path}" ${raw(blocked || !may() ? 'disabled' : '')}>Stop hosting</button></li>`;
       }) : html`<li class="muted">No chains besides Nexus.</li>`}</ul>
       <form class="inline" data-host-chain><label class="visually-hidden" for="host-chain">Chain path</label><input id="host-chain" type="text" placeholder="Nexus/Name" spellcheck="false" pattern="Nexus(/[^/\\s]+)+" ${ro}><button type="submit" ${ro}>Host chain</button></form>
       <details><summary class="small">Create a new chain</summary>
@@ -1391,19 +1422,26 @@ async function applySettings() {
 }
 
 /** Hosting changes, made at once: the operator layer is read, changed by
- *  `edit` and written back only if no one wrote it in between. Unsaved
- *  edits on the Settings page are kept. */
-async function changeHosting(edit, done) {
+ *  `edit` and written back only if no one wrote it in between; when someone
+ *  did, it is read and changed again, as `lattice child host` does. `done`
+ *  says what happened, given GET /config as it is after. Unsaved edits on
+ *  the Settings page are kept. */
+async function changeHosting(edit, done, failed = (m) => `Nothing was changed: ${m}`) {
   const n = node();
   try {
-    const { body, etag } = await readFragment(n);
-    const next = clone(body);
-    edit(next);
-    snap().config = await putFragment(n, next, etag);
-    toast(done);
+    for (let attempt = 0; ; attempt += 1) {
+      const { body, etag } = await readFragment(n);
+      const next = clone(body);
+      edit(next);
+      try {
+        snap().config = await putFragment(n, next, etag);
+        break;
+      } catch (e) { if (e.status !== 412 || attempt >= 4) throw e; }
+    }
+    toast(done(snap()));
   } catch (e) {
-    toast(e.status === 412 ? 'Someone else changed the operator settings at the same moment. Nothing was changed; try again.'
-      : e.timedOut ? 'The node did not answer in time. The change may still apply; this page shows what it reports.' : `Nothing was changed: ${e.message}`);
+    toast(e.status === 412 ? failed('the operator settings kept changing while this page wrote them; try again.')
+      : e.timedOut ? 'The node did not answer in time. The change may still apply; this page shows what it reports.' : failed(e.message));
     return false;
   } finally {
     if (settings.original) await loadSettings({ keepEdits: true });
@@ -1412,8 +1450,8 @@ async function changeHosting(edit, done) {
   return true;
 }
 const sortChains = (list) => list.sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
-function hostPath(path) {
-  return changeHosting((f) => { f.hostedChains = sortChains([...new Set([...(f.hostedChains || []), path])]); }, `Hosting ${path}`);
+function hostPath(path, failed) {
+  return changeHosting((f) => { f.hostedChains = sortChains([...new Set([...(f.hostedChains || []), path])]); }, () => `Hosting ${path}`, failed);
 }
 
 // Access (tokens) -------------------------------------------------------------
@@ -1620,14 +1658,23 @@ async function restartFlow({ wipe = false } = {}) {
 async function stopFlow() {
   const n = node();
   if (!await dialog({ title: `Stop ${n.name}?`, body: html`<p class="soft">It exits and stays stopped: this page can't start it again. Start it on its machine with <code>lattice up</code> or its service.</p>`, confirm: 'Stop', danger: true, typed: n.name })) return;
+  const startOf = async () => startMs((await get(n, 'status', { timeout: 2000 })).startedAt);
+  const before = await startOf().catch(() => undefined);
   try { await api(n, 'stop', { method: 'POST', body: {} }); } catch (e) { toast(`Stop refused: ${e.message}`); return; }
   const started = Date.now();
-  // Stopped once nothing answers.
-  while (Date.now() - started < 60000) {
-    try { await api(n, 'health', { timeout: 2000 }); } catch (e) { if ((e.status === 0 && !e.timedOut) || e.status >= 500) { toast(`${n.name} stopped.`); refresh(n.id); return; } }
+  // Stopped once nothing answers. A 503 is a node still stopping; a new
+  // start time (or, on the loopback port, a new cookie) is a new process.
+  while (Date.now() - started < 180000) {
+    try {
+      const now = await startOf();
+      if (before != null && now != null && now !== before) { toast(`${n.name} was started again, by its process manager.`); refresh(n.id); return; }
+    } catch (e) {
+      if (e.status === 0 && !e.timedOut) { toast(`${n.name} stopped.`); refresh(n.id); return; }
+      if (e.status === 401) { toast(`${n.name} was started again, by its process manager.`); refresh(n.id); return; }
+    }
     await new Promise((r) => setTimeout(r, 1000));
   }
-  toast(`${n.name} still answers a minute after it was asked to stop. Check its log.`);
+  toast(`${n.name} still answers 3 minutes after it was asked to stop. Check its log.`);
 }
 
 // ---------------------------------------------------------------- events
@@ -1654,7 +1701,7 @@ document.addEventListener('click', async (e) => {
     const ok = await changeHosting((f) => {
       f.hostedChains = (f.hostedChains || []).filter((c) => c !== path);
       if (!f.hostedChains.length) delete f.hostedChains;
-    }, `Stopped hosting ${path}`);
+    }, (after) => { const kept = stillHostedFor(after, path); return kept ? `${path}: no longer listed; ${kept}` : `Stopped hosting ${path}`; });
     if (ok && state.route.name === 'chain') location.hash = '#/';
     return;
   }
@@ -1707,7 +1754,8 @@ document.addEventListener('submit', async (e) => {
     if (!/^Nexus(\/[^/\s]+)+$/.test(path)) { toast('A chain path starts with Nexus/, like Nexus/Name'); return; }
     const premine = Number($('#cc-premine').value); const to = $('#cc-to').value.trim();
     if (premine > 0 && !to) { toast('A premine is paid to an address: give one'); return; }
-    // The spec `lattice child create` makes from the same choices.
+    // The spec `lattice child create` builds from the same flags; keep in
+    // step with lattice-node's Sources/LatticeCtl/Child.swift.
     const spec = {
       maxNumberOfTransactionsPerBlock: 1000, maxStateGrowth: 1000000, maxBlockSize: 1000000,
       premine, targetBlockTime: Number($('#cc-time').value), initialReward: Number($('#cc-reward').value),
@@ -1716,7 +1764,7 @@ document.addEventListener('submit', async (e) => {
     try {
       await get(node(), 'chains', { method: 'POST', body: { path, spec, ...(premine > 0 ? { premineTo: to } : {}) } });
     } catch (err) { toast(`Couldn't create ${path}: ${err.message}`); return; }
-    if (await hostPath(path)) f.reset();
+    if (await hostPath(path, (m) => `Created ${path}, but it isn't hosted yet: ${m} Host it again; that is safe.`)) f.reset();
     return;
   }
   if (f.id === 'new-token') {
